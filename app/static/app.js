@@ -943,6 +943,133 @@ async function runPeakAudit() {
   }
 }
 
+/* ---------------- 11. 外部刷卡批次合并预览（只读） ---------------- */
+
+let lastMergedText = "";
+
+function renderMergeErrors(errors) {
+  const ul = $("merge-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("merge-errors").hidden = false;
+  $("merge-result").hidden = true;
+}
+
+function mergeSideRow(r) {
+  const tr = document.createElement("tr");
+  tr.innerHTML = `
+    <td>${escapeHtml(r.card)}</td>
+    <td>${r.time}</td>
+    <td>${escapeHtml(r.station)}</td>
+    <td>${actionText(r.action)}</td>
+    <td class="num">第 ${r.line} 行</td>`;
+  return tr;
+}
+
+function renderMergeResult(data) {
+  $("merge-errors").hidden = true;
+  $("merge-result").hidden = false;
+
+  $("merge-summary").innerHTML =
+    `容差 <strong>${data.tolerance_seconds}</strong> 秒 · ` +
+    `基准（已保存）记录 <strong>${data.baseline_count}</strong> 条 · ` +
+    `待导入记录 <strong>${data.import_count}</strong> 条：` +
+    `重复配对 <strong>${data.pair_count}</strong> 对` +
+    `（总时间差 ${data.total_diff_seconds} 秒），` +
+    `仅基准 <strong>${data.baseline_only_count}</strong> 条，` +
+    `仅导入 <strong>${data.import_only_count}</strong> 条，` +
+    `合并后共 <strong>${data.merged_count}</strong> 条。<br>` +
+    `<span class="sub">全局一对一匹配：先最大化配对数，再最小化总时间差，` +
+    `同分按基准行号、导入行号稳定破同分；合并文本按时间排序，重复配对取基准记录。` +
+    `预览全程只读：未保存记录、未写入或清空账单。</span>`;
+
+  // 重复配对
+  const pairs = data.pairs || [];
+  $("merge-pairs-block").hidden = pairs.length === 0;
+  const ptb = $("merge-pairs-table").querySelector("tbody");
+  ptb.innerHTML = "";
+  for (const p of pairs) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(p.card)}</td>
+      <td>${escapeHtml(p.station)}</td>
+      <td>${actionText(p.action)}</td>
+      <td>${p.baseline_time}</td>
+      <td>${p.import_time}</td>
+      <td class="num">${p.diff_seconds}</td>
+      <td class="num">第 ${p.baseline_line} 行</td>
+      <td class="num">第 ${p.import_line} 行</td>`;
+    ptb.appendChild(tr);
+  }
+
+  // 仅基准记录
+  const baseOnly = data.baseline_only || [];
+  $("merge-base-only-block").hidden = baseOnly.length === 0;
+  const btb = $("merge-base-only-table").querySelector("tbody");
+  btb.innerHTML = "";
+  for (const r of baseOnly) btb.appendChild(mergeSideRow(r));
+
+  // 仅导入记录
+  const impOnly = data.import_only || [];
+  $("merge-import-only-block").hidden = impOnly.length === 0;
+  const itb = $("merge-import-only-table").querySelector("tbody");
+  itb.innerHTML = "";
+  for (const r of impOnly) itb.appendChild(mergeSideRow(r));
+
+  // 合并文本
+  lastMergedText = data.merged_text || "";
+  $("merge-merged-text").textContent = lastMergedText || "（无记录）";
+  $("btn-copy-merged").hidden = lastMergedText.length === 0;
+}
+
+async function runMergePreview() {
+  const status = $("merge-status");
+  const body = {
+    text: $("merge-text").value,
+    tolerance_seconds: Number($("merge-tolerance").value),
+  };
+  if (!Number.isFinite(body.tolerance_seconds)) {
+    status.textContent = "容差必须填写为有效数字（0～120 秒）";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "匹配中…";
+  status.className = "status";
+  $("merge-errors").hidden = true;
+  $("merge-result").hidden = true;
+  $("btn-copy-merged").hidden = true;
+  try {
+    const data = await api("/api/merge-preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    renderMergeResult(data);
+    status.textContent =
+      `预览完成：重复配对 ${data.pair_count} 对，仅基准 ` +
+      `${data.baseline_only_count} 条，仅导入 ${data.import_only_count} 条` +
+      "（只读，记录与账单均未改动）";
+    status.className = "status ok";
+    toast("合并预览已生成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderMergeErrors(errors);
+      status.textContent =
+        `存在 ${errors.length} 个错误，未生成合并预览（记录与账单均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "合并预览请求失败");
+    }
+    status.className = "status bad";
+    toast("无法生成合并预览", false);
+  }
+}
+
+function copyMergedText() {
+  if (!lastMergedText) return;
+  copyText(lastMergedText,
+    "已复制合并文本（仍未保存，可粘贴到「5. 刷卡记录」核对后再保存）");
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1050,6 +1177,8 @@ function bind() {
   $("btn-duration-audit").addEventListener("click", runDurationAudit);
   $("btn-peak-audit").addEventListener("click", runPeakAudit);
   $("btn-copy-suggests").addEventListener("click", copyAllSuggests);
+  $("btn-merge").addEventListener("click", runMergePreview);
+  $("btn-copy-merged").addEventListener("click", copyMergedText);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);

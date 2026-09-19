@@ -38,3 +38,15 @@ class PeakAuditIn(BaseModel):
     min_alert: float = Field(
         default=1,
         description="最低告警数；峰值刷卡数达到该值的组才标记告警")
+
+
+class MergePreviewIn(BaseModel):
+    """外部刷卡批次合并预览请求。
+
+    不在此处做数值约束：非法容差应走核心层校验，
+    返回与其他接口一致的 CONFIG_BAD 定位错误（HTTP 422）。
+    """
+    text: str = Field(default="", description="待导入的刷卡记录文本")
+    tolerance_seconds: float = Field(
+        default=0,
+        description="重复判定容差（秒），取 0～120 的整数")

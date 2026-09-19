@@ -1392,3 +1392,194 @@ def duration_audit(stations: list[Station],
         anomalies=anomalies,
         insufficient=insufficient,
     )
+
+
+# ---------------------------------------------------------------------------
+# 外部刷卡批次合并预览（只读：不改记录、配置或账单）
+# ---------------------------------------------------------------------------
+
+# 容差允许的秒数范围（0 = 仅时刻完全相同才视为重复）
+MERGE_TOLERANCE_MIN_SECONDS = 0
+MERGE_TOLERANCE_MAX_SECONDS = 120
+
+
+@dataclass
+class MergePreview:
+    """外部刷卡批次合并预览结果。
+
+    ok=False 时 errors 为容差参数错误（CONFIG_BAD）或待导入文本的
+    原有解析定位错误（RECORD_BAD_* 等，行号为导入文本行号）。
+    ok=True 时 pairs 为重复配对（按基准时刻、基准行号排序），
+    baseline_only / import_only 为仅一侧存在的记录（按时刻、行号排序），
+    merged_text 为按时间排序的合并记录文本（重复配对取基准记录）。
+    """
+    ok: bool
+    tolerance_seconds: int = 0
+    baseline_count: int = 0
+    import_count: int = 0
+    pair_count: int = 0
+    total_diff_seconds: int = 0
+    baseline_only_count: int = 0
+    import_only_count: int = 0
+    merged_count: int = 0
+    pairs: list[dict] = field(default_factory=list)
+    baseline_only: list[dict] = field(default_factory=list)
+    import_only: list[dict] = field(default_factory=list)
+    merged_text: str = ""
+    errors: list[dict] = field(default_factory=list)
+
+
+def _validate_merge_tolerance(tolerance_seconds) -> list[dict]:
+    """合并预览容差校验，非法时给出与其他接口一致的 CONFIG_BAD 错误。"""
+    if not _is_int_value(tolerance_seconds) or not (
+            MERGE_TOLERANCE_MIN_SECONDS <= int(tolerance_seconds)
+            <= MERGE_TOLERANCE_MAX_SECONDS):
+        return [_err(
+            "CONFIG_BAD",
+            f"容差必须为 {MERGE_TOLERANCE_MIN_SECONDS}～"
+            f"{MERGE_TOLERANCE_MAX_SECONDS} 之间的整数（秒）")]
+    return []
+
+
+def _match_group(baseline: list[Swipe], imports: list[Swipe],
+                 tolerance: int
+                 ) -> tuple[list[tuple[Swipe, Swipe, int]],
+                            list[Swipe], list[Swipe]]:
+    """单组（同卡号 / 站点 / 方向）的全局一对一匹配，动态规划。
+
+    baseline / imports 均已按 (时刻, 行号) 升序。候选配对要求
+    |基准时刻 − 导入时刻| ≤ tolerance（秒）。最优键依次为：
+    最大化配对数 → 最小化总时间差（秒）→ 配对序列按
+    （基准行号, 导入行号）字典序稳定破同分（序列按基准记录的
+    时间处理顺序列出）。
+
+    时间轴上的匹配必存在无交叉的最优解：任取交叉配对
+    (a, b')、(a', b)（a ≤ a'，b ≤ b'），交换为 (a, b)、(a', b')
+    后容差约束保持可行且总时间差不增，故按时间顺序的 DP 结果
+    即全局最优。
+
+    返回 (配对列表, 仅基准记录, 仅导入记录)；配对元素为
+    (基准记录, 导入记录, 时间差秒数)，按基准 (时刻, 行号) 顺序。
+    """
+    n, m = len(baseline), len(imports)
+    # g[i][j]：后缀 baseline[i:]、imports[j:] 的最优键
+    # 键 = (−配对数, 总时间差, 配对序列)，取最小；
+    # 配对序列元素为 (基准行号, 导入行号, i, j)，比较时即按
+    # （基准行号, 导入行号）字典序（行号各自唯一，后两位不参与决胜）。
+    g = [[None] * (m + 1) for _ in range(n + 1)]
+    for j in range(m + 1):
+        g[n][j] = (0, 0, ())
+    for i in range(n + 1):
+        g[i][m] = (0, 0, ())
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            best = g[i + 1][j]                  # 跳过基准记录 i
+            skip_imp = g[i][j + 1]              # 跳过导入记录 j
+            if skip_imp < best:
+                best = skip_imp
+            diff = abs(int((baseline[i].t - imports[j].t).total_seconds()))
+            if diff <= tolerance:               # 配对 (i, j)
+                sub = g[i + 1][j + 1]
+                cand = (sub[0] - 1, sub[1] + diff,
+                        ((baseline[i].line, imports[j].line, i, j),) + sub[2])
+                if cand < best:
+                    best = cand
+            g[i][j] = best
+
+    chosen = g[0][0][2]
+    matched_b = {p[2] for p in chosen}
+    matched_i = {p[3] for p in chosen}
+    pairs = [(baseline[i], imports[j],
+              abs(int((baseline[i].t - imports[j].t).total_seconds())))
+             for _bl, _il, i, j in chosen]
+    base_only = [baseline[i] for i in range(n) if i not in matched_b]
+    imp_only = [imports[j] for j in range(m) if j not in matched_i]
+    return pairs, base_only, imp_only
+
+
+def _swipe_dict(r: Swipe) -> dict:
+    """合并预览中单侧记录的展示结构（line 为所属文本的原始行号）。"""
+    return {"card": r.card, "time": r.time_text, "station": r.station,
+            "action": r.action, "line": r.line}
+
+
+def merge_preview(records: list[Swipe],
+                  import_text: str,
+                  tolerance_seconds,
+                  default_year: Optional[int] = None) -> MergePreview:
+    """外部刷卡批次合并预览（全程只读：不改记录、配置或账单）。
+
+    以已保存记录为基准，用 parse_records_text() 解析待导入文本
+    （解析定位错误原样返回），按（卡号, 站点, 方向）分组做全局
+    一对一匹配：仅时间差不超过容差（0～120 秒）的记录可配对；
+    先最大化配对数，再最小化总时间差，同分按（基准行号, 导入行号）
+    字典序稳定破同分。
+
+    返回重复配对、仅基准 / 仅导入记录，以及按时间排序的合并文本
+    （基准记录 + 仅导入记录，重复配对取基准记录，方向写作 进/出，
+    与录入格式兼容）。不依赖站点分区、票价与规则配置，也不执行
+    verify() 的配对 / 计价校验。
+    """
+    errors = _validate_merge_tolerance(tolerance_seconds)
+    if errors:
+        return MergePreview(ok=False, errors=errors)
+    tol = int(tolerance_seconds)
+
+    imports, parse_errors = parse_records_text(import_text,
+                                               default_year=default_year)
+    if parse_errors:
+        return MergePreview(ok=False, errors=parse_errors)
+
+    base_groups: dict[tuple[str, str, str], list[Swipe]] = {}
+    for r in records:
+        base_groups.setdefault((r.card, r.station, r.action), []).append(r)
+    imp_groups: dict[tuple[str, str, str], list[Swipe]] = {}
+    for r in imports:
+        imp_groups.setdefault((r.card, r.station, r.action), []).append(r)
+
+    matched: list[tuple[Swipe, Swipe, int]] = []
+    baseline_only: list[Swipe] = []
+    import_only: list[Swipe] = []
+    for key in sorted(set(base_groups) | set(imp_groups)):
+        bs = sorted(base_groups.get(key, []), key=lambda r: (r.t, r.line))
+        im = sorted(imp_groups.get(key, []), key=lambda r: (r.t, r.line))
+        gp, gb, gi = _match_group(bs, im, tol)
+        matched.extend(gp)
+        baseline_only.extend(gb)
+        import_only.extend(gi)
+
+    # 重复配对按（基准时刻, 基准行号）排序；单侧记录按（时刻, 行号）排序
+    matched.sort(key=lambda p: (p[0].t, p[0].line))
+    baseline_only.sort(key=lambda r: (r.t, r.line))
+    import_only.sort(key=lambda r: (r.t, r.line))
+
+    pairs = [{
+        "card": b.card, "station": b.station, "action": b.action,
+        "baseline_time": b.time_text, "import_time": i.time_text,
+        "diff_seconds": diff,
+        "baseline_line": b.line, "import_line": i.line,
+    } for b, i, diff in matched]
+
+    # 合并文本 = 全部基准记录 + 仅导入记录（重复配对取基准记录），
+    # 按（时刻, 卡号, 站点, 方向, 行号）排序，与录入格式兼容。
+    merged = sorted(list(records) + import_only,
+                    key=lambda r: (r.t, r.card, r.station, r.action, r.line))
+    merged_text = "\n".join(
+        f"{r.card}, {r.time_text}, {r.station}, {ACTION_LABELS[r.action]}"
+        for r in merged)
+
+    return MergePreview(
+        ok=True,
+        tolerance_seconds=tol,
+        baseline_count=len(records),
+        import_count=len(imports),
+        pair_count=len(pairs),
+        total_diff_seconds=sum(p["diff_seconds"] for p in pairs),
+        baseline_only_count=len(baseline_only),
+        import_only_count=len(import_only),
+        merged_count=len(merged),
+        pairs=pairs,
+        baseline_only=[_swipe_dict(r) for r in baseline_only],
+        import_only=[_swipe_dict(r) for r in import_only],
+        merged_text=merged_text,
+    )

@@ -165,9 +165,9 @@ td.wrap { white-space: normal; min-width: 240px; }
 }
 .errors-panel h3 { color: var(--danger-text); margin-top: 0; }
 #errors-list, #repair-errors-list, #audit-errors-list, #duration-errors-list,
-#peak-errors-list { margin: 0; padding-left: 20px; }
+#peak-errors-list, #merge-errors-list { margin: 0; padding-left: 20px; }
 #errors-list li, #repair-errors-list li, #audit-errors-list li,
-#duration-errors-list li, #peak-errors-list li {
+#duration-errors-list li, #peak-errors-list li, #merge-errors-list li {
   margin-bottom: 8px;
   color: var(--danger-text);
   font-size: 13px;

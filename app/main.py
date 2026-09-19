@@ -15,6 +15,7 @@ from .core import (
     Config,
     duration_audit,
     fare_path_audit,
+    merge_preview,
     parse_fares_text,
     parse_records_text,
     parse_stations_text,
@@ -24,7 +25,7 @@ from .core import (
     validate_config,
     verify,
 )
-from .schemas import ConfigIn, PeakAuditIn, TextIn, TrialConfigIn
+from .schemas import ConfigIn, MergePreviewIn, PeakAuditIn, TextIn, TrialConfigIn
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -39,7 +40,7 @@ app = FastAPI(
     title="公交刷卡票价核验台",
     description="录入站点分区、票价矩阵、换乘抵扣、每日封顶与刷卡记录，"
                 "按卡号配对进出站并核验计价。",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -378,6 +379,49 @@ def run_station_peak_audit(body: PeakAuditIn):
         "group_count": result.group_count,
         "alert_count": result.alert_count,
         "groups": result.groups,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 外部刷卡批次合并预览（只读：不改记录、不写/清空账单）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/merge-preview")
+def run_merge_preview(body: MergePreviewIn):
+    """对外部待导入刷卡批次做合并预览。
+
+    - 以已保存记录为基准，复用 parse_records_text 解析待导入文本
+      （解析定位错误原样返回）；
+    - 按（卡号, 站点, 方向）分组，仅时间差不超过容差（0～120 秒）的
+      记录可配对；全局一对一匹配：先最大化配对数，再最小化总时间差，
+      同分按（基准行号, 导入行号）稳定破同分；
+    - 返回重复配对、仅基准 / 仅导入记录与按时间排序的合并文本；
+    - 全程只读：不保存记录、不写入也不清空账单。
+    """
+    with db.connect() as conn:
+        _stations, _fares, records = db.load_domain(conn)
+        result = merge_preview(records, body.text, body.tolerance_seconds,
+                               default_year=datetime.now().year)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "tolerance_seconds": result.tolerance_seconds,
+        "baseline_count": result.baseline_count,
+        "import_count": result.import_count,
+        "pair_count": result.pair_count,
+        "total_diff_seconds": result.total_diff_seconds,
+        "baseline_only_count": result.baseline_only_count,
+        "import_only_count": result.import_only_count,
+        "merged_count": result.merged_count,
+        "pairs": result.pairs,
+        "baseline_only": result.baseline_only,
+        "import_only": result.import_only,
+        "merged_text": result.merged_text,
     }
 
 
