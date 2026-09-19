@@ -1392,3 +1392,369 @@ def duration_audit(stations: list[Station],
         anomalies=anomalies,
         insufficient=insufficient,
     )
+
+
+# ---------------------------------------------------------------------------
+# 外部刷卡批次合并预览（只读：不改记录、账单）
+# ---------------------------------------------------------------------------
+
+# 配对容差允许的秒数范围（闭区间）
+MERGE_TOLERANCE_MIN_SECONDS = 0
+MERGE_TOLERANCE_MAX_SECONDS = 120
+
+
+@dataclass
+class MergePreview:
+    """外部刷卡批次合并预览结果。
+
+    参数非法（容差不是 0～120 的整数）时 ok=False，errors 携带 CONFIG_BAD；
+    待导入文本的解析错误由调用方（parse_records_text）先行拦截。
+    ok=True 时 pairs 为重复配对（基准 ↔ 导入 一对一），base_only /
+    import_only 为两侧各自独有的记录，merged_text 为去重后按时间排序的
+    合并文本（配对取基准行）。
+    """
+    ok: bool
+    tolerance_seconds: int = 0
+    base_count: int = 0
+    import_count: int = 0
+    pair_count: int = 0
+    total_abs_diff_seconds: int = 0
+    pairs: list[dict] = field(default_factory=list)
+    base_only: list[dict] = field(default_factory=list)
+    import_only: list[dict] = field(default_factory=list)
+    merged_text: str = ""
+    errors: list[dict] = field(default_factory=list)
+
+
+def _lex_bases(base_line: list[int], import_line: list[int], n: int
+               ) -> tuple[int, int]:
+    """计算费用编码的两个进位基，保证行号分量绝不向上进位。
+
+    一条匹配至多 n 条边：导入行号总和 ≤ n·maxIL（取 B2 严格大于它）；
+    单条边中间分量为 基准行号·B2 + 导入行号，n 条之和
+    ≤ n·maxBL·B2 + n·maxIL（取 B1 严格大于它）。行号取参与匹配各点的
+    真实最大行号，分组很小时基数仍然紧凑。
+    """
+    max_bl = max(base_line, default=1) or 1
+    max_il = max(import_line, default=1) or 1
+    b2 = n * max_il + 1
+    b1 = n * max_bl * b2 + n * max_il + 1
+    return b1, b2
+
+
+def _hungarian_dense(edge_cost: dict[tuple[int, int], int],
+                     n: int, k: int, b1: int, tol: int
+                     ) -> list[tuple[int, int]]:
+    """稠密 / 完整图上的最小权匹配（e-maxx 匈牙利，整数标量费用）。
+
+    列为 k 条真实导入列 + n 条虚拟列；候选边取已编码整数费用，非候选边
+    取足够大的禁止值，虚拟列（未配对）费用 = n·(tol+1)·B1：
+    它严格高于任何 n 条候选边的时间差分量总和（每条 ≤ tol，
+    加权行号后仍可由 B1 主导），故匹配先最大化配对数、再最小化总费用
+    （总时间差 → 基准行号和 → 导入行号和）。
+    """
+    forbidden = 10 ** 30
+    dummy = n * (tol + 1) * b1
+    m = k + n
+    cost = [[forbidden] * m for _ in range(n)]
+    for (bi, ii), c in edge_cost.items():
+        cost[bi][ii] = c
+    for bi in range(n):
+        for j in range(k, m):
+            cost[bi][j] = dummy
+
+    INF = 10 ** 36
+    u = [0] * (n + 1)
+    v = [0] * (m + 1)
+    p = [0] * (m + 1)
+    way = [0] * (m + 1)
+    for i in range(1, n + 1):
+        p[0] = i
+        j0 = 0
+        minv = [INF] * (m + 1)
+        used = [False] * (m + 1)
+        while p[j0] != 0:
+            used[j0] = True
+            i0 = p[j0]
+            delta = INF
+            j1 = 0
+            r = cost[i0 - 1]
+            ui = u[i0]
+            for j in range(1, m + 1):
+                if not used[j]:
+                    cur = r[j - 1] - ui - v[j]
+                    if cur < minv[j]:
+                        minv[j] = cur
+                        way[j] = j0
+                    if minv[j] < delta:
+                        delta = minv[j]
+                        j1 = j
+            for j in range(m + 1):
+                if used[j]:
+                    u[p[j]] += delta
+                    v[j] -= delta
+                else:
+                    minv[j] -= delta
+            j0 = j1
+        while True:
+            j1 = way[j0]
+            p[j0] = p[j1]
+            j0 = j1
+            if j0 == 0:
+                break
+
+    pairs = []
+    for j in range(1, m + 1):
+        if p[j] != 0 and j - 1 < k:
+            pairs.append((p[j] - 1, j - 1))
+    return pairs
+
+
+def _min_cost_flow(edge_cost: dict[tuple[int, int], int],
+                   n: int, k: int) -> list[tuple[int, int]]:
+    """稀疏图上的最小费用最大流：源→基准→候选导入→汇，容量均为 1。
+
+    沿最短路逐次增广 1 单位，直到汇不可达为止；流量即最大配对数，
+    且在最大配对数下费用最小（Johnson 势 + Dijkstra，初始费用非负）。
+    相比稠密匈牙利 O(n³)，只遍历容差窗口内的候选边。
+    """
+    S = n + k
+    T = n + k + 1
+    V = T + 1
+    graph: list[list[list]] = [[] for _ in range(V)]
+
+    def add_edge(u, v, cap, w):
+        graph[u].append([v, cap, w, len(graph[v])])
+        graph[v].append([u, 0, -w, len(graph[u]) - 1])
+
+    for bi in range(n):
+        add_edge(S, bi, 1, 0)
+    for ii in range(k):
+        add_edge(n + ii, T, 1, 0)
+    cand_ref: dict[tuple[int, int], list] = {}
+    for (bi, ii), w in edge_cost.items():
+        add_edge(bi, n + ii, 1, w)
+        cand_ref[(bi, ii)] = graph[bi][-1]
+
+    pot = [0] * V
+    for _ in range(n):
+        dist: list[Optional[int]] = [None] * V
+        prev_v = [-1] * V
+        prev_e = [-1] * V
+        dist[S] = 0
+        pq = [(0, S)]
+        while pq:
+            d, u = heapq.heappop(pq)
+            if d != dist[u]:
+                continue
+            for ei, e in enumerate(graph[u]):
+                v2, cap, w, _rev = e
+                if cap <= 0:
+                    continue
+                nd = d + w + pot[u] - pot[v2]
+                if dist[v2] is None or nd < dist[v2]:
+                    dist[v2] = nd
+                    prev_v[v2] = u
+                    prev_e[v2] = ei
+                    heapq.heappush(pq, (nd, v2))
+        if dist[T] is None:
+            break  # 已达最大流
+        for v2 in range(V):
+            if dist[v2] is not None:
+                pot[v2] += dist[v2]
+        v2 = T
+        while v2 != S:
+            u = prev_v[v2]
+            e = graph[u][prev_e[v2]]
+            e[1] -= 1
+            graph[e[0]][e[3]][1] += 1
+            v2 = u
+
+    return [(bi, ii) for (bi, ii), e in cand_ref.items() if e[1] == 0]
+
+
+def _match_group(base: list[Swipe], imports: list[Swipe], tolerance: int
+                 ) -> list[tuple[int, int, int]]:
+    """单个（卡号, 站点, 方向）分组内的全局一对一匹配。
+
+    仅当 |基准时刻 − 导入时刻| ≤ tolerance（秒）时建立候选边。
+    匹配目标依次为：
+      1) 配对数最多（最大基数匹配）；
+      2) 配对的总绝对时间差最小；
+      3) 时间差总和相同时，依次最小化基准行号总和、导入行号总和
+         （行号为录入文本原始行，结果与处理顺序无关）。
+
+    候选边费用编码为整数  diff·B1 + 基准行号·B2 + 导入行号，
+    B1/B2 取大于任意行号总和的进位基，使整数费用比较等价于上述字典序。
+    先剔除不可能配对的孤立点；稠密 / 完整图用匈牙利算法，
+    稀疏图（容差窗口内候选很少）用最小费用最大流。
+
+    返回 [(基准下标, 导入下标, 绝对时间差秒), ...]。
+    """
+    n_all, k_all = len(base), len(imports)
+    if n_all == 0 or k_all == 0:
+        return []
+
+    # 候选边（原始下标, 秒级绝对时间差）：两侧按时刻排序后滑动窗口生成，
+    # 只枚举 |Δt| ≤ tolerance 的对，避免对容差窗口外的记录对做无谓比较。
+    bo = sorted(range(n_all), key=lambda i: (base[i].t, base[i].line))
+    xo = sorted(range(k_all), key=lambda j: (imports[j].t, imports[j].line))
+    bsec = [int(base[i].t.timestamp()) for i in bo]
+    xsec = [int(imports[j].t.timestamp()) for j in xo]
+    cand: dict[tuple[int, int], int] = {}
+    lo = hi = 0
+    for pos, bi in enumerate(bo):
+        t = bsec[pos]
+        while lo < k_all and xsec[lo] < t - tolerance:
+            lo += 1
+        if hi < lo:
+            hi = lo
+        while hi < k_all and xsec[hi] <= t + tolerance:
+            hi += 1
+        for q in range(lo, hi):
+            cand[(bi, xo[q])] = abs(t - xsec[q])
+    if not cand:
+        return []
+
+    # 剔除孤立点：只保留至少有一条候选边的基准 / 导入，压缩成连续子图
+    used_b = sorted({bi for bi, _ in cand})
+    used_i = sorted({ii for _ , ii in cand})
+    bidx = {bi: r for r, bi in enumerate(used_b)}
+    iidx = {ii: c for c, ii in enumerate(used_i)}
+    n, k = len(used_b), len(used_i)
+    bl = [base[bi].line for bi in used_b]
+    il = [imports[ii].line for ii in used_i]
+    b1, b2 = _lex_bases(bl, il, n)
+    edge_cost = {
+        (bidx[bi], iidx[ii]): diff * b1 + base[bi].line * b2 + imports[ii].line
+        for (bi, ii), diff in cand.items()
+    }
+
+    # 稠密（候选占比高）走匈牙利；稀疏走费用流。完整图也归入稠密分支。
+    density = len(edge_cost) / (n * k)
+    if density >= 0.5:
+        rows = _hungarian_dense(edge_cost, n, k, b1, tolerance)
+    else:
+        rows = _min_cost_flow(edge_cost, n, k)
+
+    return [(used_b[r], used_i[c], cand[(used_b[r], used_i[c])])
+            for r, c in rows]
+
+
+def _merge_item(sw: Swipe, source: str) -> dict:
+    return {
+        "card": sw.card,
+        "time": sw.time_text,
+        "station": sw.station,
+        "action": sw.action,
+        "direction": ACTION_LABELS.get(sw.action, sw.action),
+        "line": sw.line,
+        "source": source,  # base = 已保存基准记录；import = 待导入记录
+    }
+
+
+def _merge_record_line(card: str, t: datetime, station: str, action: str) -> str:
+    return (f"{card}, {t.strftime('%Y-%m-%d %H:%M:%S')}, {station}, "
+            f"{'进' if action == ACTION_IN else '出'}")
+
+
+def external_merge_preview(base_records: list[Swipe],
+                           import_records: list[Swipe],
+                           tolerance_seconds) -> MergePreview:
+    """外部刷卡批次合并预览（全程只读：不改记录、不写/清空账单）。
+
+    - 以**已保存记录为基准**，待导入记录由 parse_records_text() 完成行格式
+      解析（解析错误在调用方按原有定位错误返回）；
+    - 仅当两条记录的**卡号、站点、进/出方向相同**且时间差不超过
+      tolerance 秒（0～120）时建立候选；
+    - 按（卡号, 站点, 方向）分组各自做**全局一对一匹配**：先最大化配对数，
+      再最小化配对的总绝对时间差，完全同分时以基准行号、导入行号稳定破同分；
+    - 返回重复配对、仅基准记录、仅导入记录，以及去重后按时间排序的合并文本
+      （配对取基准行，格式与录入文本兼容，可直接复制核对）。
+    """
+    if not _is_int_value(tolerance_seconds) \
+            or not (MERGE_TOLERANCE_MIN_SECONDS
+                    <= int(tolerance_seconds) <= MERGE_TOLERANCE_MAX_SECONDS):
+        return MergePreview(
+            ok=False,
+            errors=[_err(
+                "CONFIG_BAD",
+                f"合并容差必须为 {MERGE_TOLERANCE_MIN_SECONDS}～"
+                f"{MERGE_TOLERANCE_MAX_SECONDS} 之间的整数（秒）")])
+    tolerance = int(tolerance_seconds)
+
+    groups: dict[tuple[str, str, str],
+                 dict[str, list[Swipe]]] = {}
+    for r in base_records:
+        groups.setdefault((r.card, r.station, r.action),
+                          {"base": [], "import": []})["base"].append(r)
+    for r in import_records:
+        groups.setdefault((r.card, r.station, r.action),
+                          {"base": [], "import": []})["import"].append(r)
+
+    pair_objs: list[dict] = []
+    matched_base: set[int] = set()   # 以 id() 标记被配对的基准记录
+    matched_import: set[int] = set()
+    total_diff = 0
+    # 合并文本中的条目：(排序键, 文本行)
+    merged_entries: list[tuple[tuple, str]] = []
+
+    for key in sorted(groups):
+        g = groups[key]
+        bs, xs = g["base"], g["import"]
+        pairs = _match_group(bs, xs, tolerance)
+        for bi, ii, diff in pairs:
+            b, x = bs[bi], xs[ii]
+            matched_base.add(id(b))
+            matched_import.add(id(x))
+            total_diff += diff
+            pair_objs.append({
+                "card": b.card,
+                "station": b.station,
+                "action": b.action,
+                "direction": ACTION_LABELS.get(b.action, b.action),
+                "base": _merge_item(b, "base"),
+                "import": _merge_item(x, "import"),
+                "base_time": b.time_text,
+                "import_time": x.time_text,
+                "abs_diff_seconds": diff,
+                "delta_seconds": int((x.t - b.t).total_seconds()),
+            })
+            # 配对以基准行计入合并文本
+            merged_entries.append((
+                (b.t, b.card, b.station, b.action, 0, b.line),
+                _merge_record_line(b.card, b.t, b.station, b.action)))
+
+    base_only = [r for r in base_records if id(r) not in matched_base]
+    import_only = [r for r in import_records if id(r) not in matched_import]
+    for r in base_only:
+        merged_entries.append((
+            (r.t, r.card, r.station, r.action, 0, r.line),
+            _merge_record_line(r.card, r.t, r.station, r.action)))
+    for r in import_only:
+        merged_entries.append((
+            (r.t, r.card, r.station, r.action, 1, r.line),
+            _merge_record_line(r.card, r.t, r.station, r.action)))
+    merged_entries.sort(key=lambda e: e[0])
+
+    pair_objs.sort(key=lambda p: (p["base"]["time"], p["base"]["line"],
+                                  p["import"]["line"]))
+    base_only_items = sorted(
+        (_merge_item(r, "base") for r in base_only),
+        key=lambda it: (it["time"], it["line"]))
+    import_only_items = sorted(
+        (_merge_item(r, "import") for r in import_only),
+        key=lambda it: (it["time"], it["line"]))
+
+    return MergePreview(
+        ok=True,
+        tolerance_seconds=tolerance,
+        base_count=len(base_records),
+        import_count=len(import_records),
+        pair_count=len(pair_objs),
+        total_abs_diff_seconds=total_diff,
+        pairs=pair_objs,
+        base_only=base_only_items,
+        import_only=import_only_items,
+        merged_text="\n".join(line for _key, line in merged_entries),
+    )

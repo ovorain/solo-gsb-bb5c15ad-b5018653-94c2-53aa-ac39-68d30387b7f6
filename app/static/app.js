@@ -943,6 +943,142 @@ async function runPeakAudit() {
   }
 }
 
+/* ---------------- 11. 外部刷卡批次合并预览（只读） ---------------- */
+
+let lastMergedText = "";
+
+function renderMergeErrors(errors) {
+  const ul = $("merge-errors-list");
+  ul.innerHTML = "";
+  for (const e of errors) ul.appendChild(renderErrorLi(e));
+  $("merge-errors").hidden = false;
+  $("merge-result").hidden = true;
+}
+
+function mergeDeltaText(sec) {
+  const sign = sec > 0 ? "+" : sec < 0 ? "−" : "±";
+  return `${sign}${Math.abs(sec)} 秒`;
+}
+
+function renderMergeRecordRow(r, lineKey) {
+  return `<td>${escapeHtml(r.card)}</td><td>${r.time}</td>` +
+    `<td>${escapeHtml(r.station)}</td><td>${actionText(r.action)}</td>` +
+    `<td class="num">第 ${r[lineKey]} 行</td>`;
+}
+
+function renderMergePreview(data) {
+  $("merge-errors").hidden = true;
+  $("merge-result").hidden = false;
+
+  const pairs = data.pairs || [];
+  const baseOnly = data.base_only || [];
+  const importOnly = data.import_only || [];
+  lastMergedText = data.merged_text || "";
+
+  $("merge-summary").innerHTML =
+    `容差 <strong>${data.tolerance_seconds}</strong> 秒 · ` +
+    `基准 <strong>${data.base_count}</strong> 条 · 待导入 <strong>${data.import_count}</strong> 条：` +
+    `重复配对 <strong>${data.pair_count}</strong> 对` +
+    `（总时间差 <strong>${data.total_abs_diff_seconds}</strong> 秒），` +
+    `仅基准 <strong>${baseOnly.length}</strong> 条，仅导入 <strong>${importOnly.length}</strong> 条，` +
+    `合并后共 <strong>${data.merged_count}</strong> 条。<br>` +
+    `<span class="sub">匹配先最大化配对数，再最小化总时间差，同分时按基准行号、导入行号稳定破同分；` +
+    `预览全程只读：待导入记录未保存，已保存记录与账单均未改动。</span>`;
+
+  // 重复配对
+  const pBlock = $("merge-pairs-block");
+  pBlock.hidden = pairs.length === 0;
+  const ptb = $("merge-pairs-table").querySelector("tbody");
+  ptb.innerHTML = "";
+  for (const p of pairs) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${escapeHtml(p.card)}</td>
+      <td>${escapeHtml(p.station)}</td>
+      <td>${actionText(p.action)}</td>
+      <td>${p.base_time}<span class="sub">（第 ${p.base.line} 行）</span></td>
+      <td>${p.import_time}<span class="sub">（第 ${p.import.line} 行）</span></td>
+      <td class="num ${p.abs_diff_seconds === 0 ? "delta-zero" : ""}">${p.abs_diff_seconds}</td>
+      <td class="num ${p.delta_seconds > 0 ? "delta-up" : p.delta_seconds < 0 ? "delta-down" : "delta-zero"}">${mergeDeltaText(p.delta_seconds)}</td>`;
+    ptb.appendChild(tr);
+  }
+
+  // 仅基准
+  const bBlock = $("merge-base-only-block");
+  bBlock.hidden = baseOnly.length === 0;
+  const btb = $("merge-base-only-table").querySelector("tbody");
+  btb.innerHTML = "";
+  for (const r of baseOnly) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = renderMergeRecordRow(r, "line");
+    btb.appendChild(tr);
+  }
+
+  // 仅导入
+  const iBlock = $("merge-import-only-block");
+  iBlock.hidden = importOnly.length === 0;
+  const itb = $("merge-import-only-table").querySelector("tbody");
+  itb.innerHTML = "";
+  for (const r of importOnly) {
+    const tr = document.createElement("tr");
+    tr.innerHTML = renderMergeRecordRow(r, "line");
+    itb.appendChild(tr);
+  }
+
+  $("merge-merged-text").textContent = lastMergedText || "（合并后无记录）";
+}
+
+async function runMergePreview() {
+  const status = $("merge-status");
+  const tolerance = Number($("merge-tolerance").value);
+  if (!Number.isFinite(tolerance)) {
+    status.textContent = "时间容差必须填写为 0～120 的整数（秒）";
+    status.className = "status bad";
+    return;
+  }
+  status.textContent = "合并匹配中…";
+  status.className = "status";
+  $("merge-errors").hidden = true;
+  $("merge-result").hidden = true;
+  try {
+    const data = await api("/api/external-merge-preview", {
+      method: "POST",
+      body: JSON.stringify({
+        text: $("merge-text").value,
+        tolerance_seconds: tolerance,
+      }),
+    });
+    renderMergePreview(data);
+    status.textContent =
+      `预览完成：${data.pair_count} 对重复，仅基准 ${data.base_only_count} 条，` +
+      `仅导入 ${data.import_only_count} 条（只读，记录与账单均未改动）`;
+    status.className = "status ok";
+    toast("合并预览已生成（只读，未保存任何改动）");
+  } catch (e) {
+    const errors = (e.payload && e.payload.errors) || [];
+    if (errors.length) {
+      renderMergeErrors(errors);
+      status.textContent =
+        errors[0] && errors[0].code === "CONFIG_BAD"
+          ? "容差参数不合法，未生成预览"
+          : `待导入记录存在 ${errors.length} 个解析错误，未生成预览（数据均未改动）`;
+    } else {
+      status.textContent = summaryError(e, "合并预览请求失败");
+    }
+    status.className = "status bad";
+    toast("无法生成合并预览", false);
+  }
+}
+
+function copyMergedText() {
+  if (!lastMergedText) {
+    toast("暂无可复制的合并文本", false);
+    return;
+  }
+  copyText(lastMergedText,
+    `已复制 ${lastMergedText.split("\n").length} 行合并文本（仍未保存，可粘贴到记录区核对）`);
+}
+
 /* ---------------- 演示数据 ---------------- */
 
 const DEMO = {
@@ -1050,6 +1186,8 @@ function bind() {
   $("btn-duration-audit").addEventListener("click", runDurationAudit);
   $("btn-peak-audit").addEventListener("click", runPeakAudit);
   $("btn-copy-suggests").addEventListener("click", copyAllSuggests);
+  $("btn-merge").addEventListener("click", runMergePreview);
+  $("btn-merge-copy").addEventListener("click", copyMergedText);
   $("btn-verify").addEventListener("click", runVerify);
   $("btn-verify-top").addEventListener("click", runVerify);
   $("btn-demo").addEventListener("click", loadDemo);

@@ -14,6 +14,7 @@ from . import db
 from .core import (
     Config,
     duration_audit,
+    external_merge_preview,
     fare_path_audit,
     parse_fares_text,
     parse_records_text,
@@ -24,7 +25,13 @@ from .core import (
     validate_config,
     verify,
 )
-from .schemas import ConfigIn, PeakAuditIn, TextIn, TrialConfigIn
+from .schemas import (
+    ConfigIn,
+    MergePreviewIn,
+    PeakAuditIn,
+    TextIn,
+    TrialConfigIn,
+)
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -378,6 +385,55 @@ def run_station_peak_audit(body: PeakAuditIn):
         "group_count": result.group_count,
         "alert_count": result.alert_count,
         "groups": result.groups,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 外部刷卡批次合并预览（只读：不改记录、账单）
+# ---------------------------------------------------------------------------
+
+@app.post("/api/external-merge-preview")
+def run_external_merge_preview(body: MergePreviewIn):
+    """以已保存刷卡记录为基准，预览与外部待导入批次的合并结果。
+
+    - 待导入文本复用 parse_records_text 做行格式解析，解析失败时返回
+      422 与原有定位错误（RECORD_BAD_*，行号指向粘贴文本）；
+    - 以已保存记录为基准，仅在卡号、站点、进/出方向相同且时间差不超过
+      容差（0～120 秒）时建立候选；按键分组做全局一对一匹配：
+      先最大化配对数，再最小化总绝对时间差，同分时以基准行号、导入行号
+      稳定破同分；
+    - 返回重复配对、仅基准 / 仅导入记录与去重后按时间排序的合并文本；
+    - 全程只读：不保存待导入记录、不修改已保存记录，也不写入或清空账单。
+    """
+    default_year = datetime.now().year
+    import_records, parse_errors = parse_records_text(
+        body.text, default_year=default_year)
+    if parse_errors:
+        return _parse_error_response(parse_errors)
+    with db.connect() as conn:
+        _stations, _fares, base_records = db.load_domain(conn)
+        result = external_merge_preview(
+            base_records, import_records, body.tolerance_seconds)
+
+    if not result.ok:
+        return JSONResponse(
+            status_code=422,
+            content={"ok": False, "errors": result.errors})
+
+    return {
+        "ok": True,
+        "tolerance_seconds": result.tolerance_seconds,
+        "base_count": result.base_count,
+        "import_count": result.import_count,
+        "pair_count": result.pair_count,
+        "base_only_count": len(result.base_only),
+        "import_only_count": len(result.import_only),
+        "merged_count": result.base_count + len(result.import_only),
+        "total_abs_diff_seconds": result.total_abs_diff_seconds,
+        "pairs": result.pairs,
+        "base_only": result.base_only,
+        "import_only": result.import_only,
+        "merged_text": result.merged_text,
     }
 
 
